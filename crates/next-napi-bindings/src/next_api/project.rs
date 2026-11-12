@@ -1709,6 +1709,7 @@ pub async fn all_entrypoints_write_to_disk_operation(
 
     turbo_tasks().send_compilation_event(Arc::new(TraceEvent::new_with_duration(
         "turbopack-write-entrypoints",
+        true,
         wall_start,
         start.elapsed(),
         serde_json::json!([]),
@@ -1788,6 +1789,7 @@ async fn emit_all_output_assets_once_with_issues_operation(
 
     turbo_tasks().send_compilation_event(Arc::new(TraceEvent::new_with_duration(
         "turbopack-emit",
+        true,
         wall_start,
         start.elapsed(),
         serde_json::json!([]),
