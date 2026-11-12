@@ -374,6 +374,7 @@ function createServerModuleMap(): ServerModuleMap {
         | {
             moduleId: string | number
             async: boolean
+            durability?: number
           }
         | undefined
 
@@ -394,14 +395,17 @@ function createServerModuleMap(): ServerModuleMap {
         throw getActionNotFoundError(id)
       }
 
-      const { moduleId, async } = workerEntry
+      const { moduleId, async, durability } = workerEntry
 
       return {
         id: moduleId,
         name: id,
         chunks: [],
         async,
-        durability: action.durability,
+        durability:
+          durability !== undefined
+            ? action.durability?.[durability]
+            : undefined,
       }
     },
   })
