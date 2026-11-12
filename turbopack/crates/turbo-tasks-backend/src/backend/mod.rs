@@ -1833,6 +1833,18 @@ impl TurboTasksBackend {
         // modify via a write guard so we synchronize with top level calls into try_execute_context
         *self.stopping.write() = true;
         self.activity.publish_stopping();
+        if std::env::var("TURBO_ENGINE_COLLECTIBLE_STATS").is_ok_and(|v| v == "1") {
+            use std::sync::atomic::Ordering;
+            let stats = &operation::COLLECTIBLE_STATS;
+            eprintln!(
+                "collectible stats: delay={} applied={} staged={} flushed={} dropped={}",
+                operation::delay_collectibles(),
+                stats.applied.load(Ordering::Relaxed),
+                stats.staged.load(Ordering::Relaxed),
+                stats.flushed.load(Ordering::Relaxed),
+                stats.dropped.load(Ordering::Relaxed),
+            );
+        }
     }
 
     #[allow(unused_variables)]

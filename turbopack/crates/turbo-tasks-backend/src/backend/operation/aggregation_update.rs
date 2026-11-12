@@ -75,6 +75,10 @@ use std::{
     hash::Hash,
     mem::{swap, take},
     num::NonZeroU32,
+    sync::{
+        LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use indexmap::map::Entry;
@@ -146,6 +150,121 @@ pub fn is_aggregating_node(aggregation_number: u32) -> bool {
 /// Returns true, when a node is aggregating the whole subgraph.
 pub fn is_root_node(aggregation_number: u32) -> bool {
     aggregation_number == u32::MAX
+}
+
+/// Whether delayed collectible propagation is enabled (`TURBO_ENGINE_DELAY_COLLECTIBLES=1`).
+///
+/// When enabled, a task that is dirty doesn't send changes of its contribution to the aggregated
+/// collectibles of its uppers right away. They are netted in the task's `pending_collectibles` and
+/// sent once, together with the aggregated update that makes the task clean (see
+/// [`stage_outgoing_collectibles`]).
+pub fn delay_collectibles() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = DELAY_COLLECTIBLES_FOR_TESTING.with(|c| c.get()) {
+        return enabled;
+    }
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var("TURBO_ENGINE_DELAY_COLLECTIBLES").is_ok_and(|v| v == "1"));
+    *ENABLED
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Overrides [`delay_collectibles`] for the current thread in unit tests.
+    static DELAY_COLLECTIBLES_FOR_TESTING: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Counters for evaluating collectible propagation (`TURBO_ENGINE_COLLECTIBLE_STATS=1` prints them
+/// when the backend stops).
+pub struct CollectibleStats {
+    /// Collectible entries applied to an upper's aggregated collectibles.
+    pub applied: AtomicU64,
+    /// Collectible entries put into `pending_collectibles` instead of being sent to the uppers.
+    pub staged: AtomicU64,
+    /// Entries of `pending_collectibles` sent to the uppers when the task became clean.
+    pub flushed: AtomicU64,
+    /// Entries of `pending_collectibles` dropped because the task had no uppers.
+    pub dropped: AtomicU64,
+}
+
+pub static COLLECTIBLE_STATS: CollectibleStats = CollectibleStats {
+    applied: AtomicU64::new(0),
+    staged: AtomicU64::new(0),
+    flushed: AtomicU64::new(0),
+    dropped: AtomicU64::new(0),
+};
+
+/// Whether the task counts as dirty for strongly consistent reads, i.e. as a dirty container that
+/// is not clean in the current session in all of its uppers.
+fn is_effectively_dirty(task: &TaskGuard<'_>) -> bool {
+    task.is_dirty().is_some() || task.has_dirty_containers()
+}
+
+/// Delayed collectible propagation: decides which collectible changes of `update`, an update of
+/// the contribution of `task` to its uppers, are sent now. Must be called under the lock of `task`,
+/// after its dirty state has been updated, for every outgoing update of the task.
+///
+/// - While the task is dirty, the collectible changes are moved into the task's
+///   `pending_collectibles`, where positive and negative changes of the same collectible cancel
+///   out. Only the dirty state part of `update` is sent.
+/// - Once the task is clean, the pending changes are added to `update`. The update that makes the
+///   task clean always passes here, so they are sent together with it.
+/// - Without uppers nobody has seen the contribution, so the pending changes are dropped.
+/// - Pending changes restored from a cache written with the delay enabled are always drained, also
+///   when the delay is disabled for this session.
+///
+/// This keeps the invariant that a task with pending collectibles is a dirty container (not clean
+/// in the current session) in all its uppers, so these uppers aren't clean either. A strongly
+/// consistent read waits until the task it reads is clean, so it never misses pending changes.
+///
+/// [`AggregatedDataUpdate::from_task`] subtracts the pending changes, so that new and removed
+/// uppers see the same contribution as the existing uppers.
+fn stage_outgoing_collectibles(task: &mut TaskGuard<'_>, update: &mut AggregatedDataUpdate) {
+    let delay = delay_collectibles();
+    let has_pending = !task.is_pending_collectibles_empty();
+    if !delay && !has_pending {
+        return;
+    }
+    if update.collectibles_update.is_empty() && !has_pending {
+        return;
+    }
+    if task.is_upper_empty() {
+        if has_pending {
+            let pending: CollectiblesUpdateVec = task
+                .iter_pending_collectibles()
+                .map(|(&k, &v)| (k, v))
+                .collect();
+            COLLECTIBLE_STATS
+                .dropped
+                .fetch_add(pending.len() as u64, Ordering::Relaxed);
+            for (collectible, _) in pending {
+                task.remove_pending_collectibles(&collectible);
+            }
+        }
+        return;
+    }
+    if delay && is_effectively_dirty(task) {
+        let staged = take(&mut update.collectibles_update);
+        COLLECTIBLE_STATS
+            .staged
+            .fetch_add(staged.len() as u64, Ordering::Relaxed);
+        for (collectible, count) in staged {
+            let _ = task.update_pending_collectibles_count(collectible, count);
+        }
+    } else if has_pending {
+        let pending: CollectiblesUpdateVec = task
+            .iter_pending_collectibles()
+            .map(|(&k, &v)| (k, v))
+            .collect();
+        COLLECTIBLE_STATS
+            .flushed
+            .fetch_add(pending.len() as u64, Ordering::Relaxed);
+        for (collectible, _) in pending.iter() {
+            task.remove_pending_collectibles(collectible);
+        }
+        update.collectibles_update.extend(pending);
+    }
 }
 
 /// Returns a list of tasks that are considered as "following" the task.
@@ -453,8 +572,12 @@ impl AggregationUpdateJob {
 
     pub fn data_update(
         task: &mut TaskGuard<'_>,
-        update: AggregatedDataUpdate,
+        mut update: AggregatedDataUpdate,
     ) -> Option<AggregationUpdateJob> {
+        stage_outgoing_collectibles(task, &mut update);
+        if update.is_empty() {
+            return None;
+        }
         let upper_ids: SmallVec<_> = get_uppers(task);
         if !upper_ids.is_empty() {
             Some(
@@ -540,6 +663,9 @@ impl AggregatedDataUpdate {
         } else {
             task.iter_collectibles().map(|(&k, &v)| (k, v)).collect()
         };
+        // The uppers haven't seen the pending changes yet (see `stage_outgoing_collectibles`).
+        let mut collectibles_update = collectibles_update;
+        collectibles_update.extend(task.iter_pending_collectibles().map(|(&k, &v)| (k, -v)));
         let (dirty, current_session_clean) = task.dirty_state();
         if dirty {
             dirty_count += 1;
@@ -829,6 +955,11 @@ impl AggregatedDataUpdate {
                 }
             }
         }
+        if !collectibles_update.is_empty() {
+            COLLECTIBLE_STATS
+                .applied
+                .fetch_add(collectibles_update.len() as u64, Ordering::Relaxed);
+        }
         for (collectible, count) in collectibles_update {
             let mut added = false;
             let mut removed = false;
@@ -862,6 +993,7 @@ impl AggregatedDataUpdate {
                 result.collectibles_update.push((*collectible, -1));
             }
         }
+        stage_outgoing_collectibles(task, &mut result);
         result
     }
 
@@ -5553,6 +5685,136 @@ mod follower_debt_tests {
                 .await
                 .is_some()
         );
+    }
+}
+
+/// Deterministic tests of delayed collectible propagation (see `stage_outgoing_collectibles`).
+#[cfg(test)]
+mod delayed_collectibles_tests {
+    use turbo_tasks::{TaskPriority, TurboTasks};
+
+    use super::{
+        AggregationUpdateQueue, DELAY_COLLECTIBLES_FOR_TESTING,
+        follower_debt_tests::{
+            INNER, UPPER, add, aggregated, collectible, id, remove, run, setup_with_data,
+        },
+    };
+    use crate::{
+        backend::{
+            TaskDataCategory, TurboTasksBackend,
+            operation::{ExecuteContext, UpdateCollectibleOperation},
+            storage_schema::TaskStorageAccessors,
+        },
+        data::Dirtyness,
+    };
+
+    struct DelayOverride;
+
+    impl DelayOverride {
+        fn set(enabled: bool) -> Self {
+            DELAY_COLLECTIBLES_FOR_TESTING.with(|c| c.set(Some(enabled)));
+            DelayOverride
+        }
+    }
+
+    impl Drop for DelayOverride {
+        fn drop(&mut self) {
+            DELAY_COLLECTIBLES_FOR_TESTING.with(|c| c.set(None));
+        }
+    }
+
+    fn set_dirty(tt: &TurboTasks<TurboTasksBackend>, task: u32, dirty: bool) {
+        let mut ctx = ExecuteContext::new(tt.backend(), tt);
+        let job = {
+            let mut task = ctx.task(id(task), TaskDataCategory::All);
+            task.update_dirty_state(dirty.then_some(Dirtyness::Dirty {
+                parent_priority: TaskPriority::leaf(),
+                #[cfg(feature = "task_dirty_cause")]
+                cause: turbo_tasks::TaskDirtyCause::InitialDirty,
+            }))
+        };
+        if let Some(job) = job {
+            let mut queue = AggregationUpdateQueue::new_without_optimizations();
+            queue.push(job);
+            queue.execute(&mut ctx);
+        }
+    }
+
+    fn emit(tt: &TurboTasks<TurboTasksBackend>, task: u32, count: i32) {
+        UpdateCollectibleOperation::run(
+            id(task),
+            collectible(),
+            count,
+            ExecuteContext::new(tt.backend(), tt),
+        );
+    }
+
+    fn pending(tt: &TurboTasks<TurboTasksBackend>, task: u32) -> i32 {
+        let mut ctx = ExecuteContext::new(tt.backend(), tt);
+        let task = ctx.task(id(task), TaskDataCategory::Meta);
+        task.get_pending_collectibles(&collectible())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn has_dirty_containers(tt: &TurboTasks<TurboTasksBackend>, task: u32) -> bool {
+        let mut ctx = ExecuteContext::new(tt.backend(), tt);
+        let task = ctx.task(id(task), TaskDataCategory::Meta);
+        task.has_dirty_containers()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn changes_net_while_dirty_and_flush_with_clean() {
+        let _delay = DelayOverride::set(true);
+        let tt = setup_with_data(&[(1, UPPER), (2, INNER)], false);
+        run(&tt, [add(1, 2)]);
+        set_dirty(&tt, 2, true);
+        assert!(has_dirty_containers(&tt, 1));
+
+        emit(&tt, 2, 1);
+        assert_eq!((aggregated(&tt, 1), pending(&tt, 2)), (0, 1));
+        emit(&tt, 2, -1);
+        assert_eq!((aggregated(&tt, 1), pending(&tt, 2)), (0, 0));
+        emit(&tt, 2, 1);
+        assert_eq!((aggregated(&tt, 1), pending(&tt, 2)), (0, 1));
+
+        set_dirty(&tt, 2, false);
+        assert!(!has_dirty_containers(&tt, 1));
+        assert_eq!((aggregated(&tt, 1), pending(&tt, 2)), (1, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn edges_use_the_published_contribution() {
+        let _delay = DelayOverride::set(true);
+        let tt = setup_with_data(&[(1, UPPER), (2, INNER), (3, UPPER)], false);
+        run(&tt, [add(1, 2)]);
+        set_dirty(&tt, 2, true);
+        emit(&tt, 2, 1);
+
+        run(&tt, [add(3, 2)]);
+        assert_eq!((aggregated(&tt, 1), aggregated(&tt, 3)), (0, 0));
+
+        set_dirty(&tt, 2, false);
+        assert_eq!((aggregated(&tt, 1), aggregated(&tt, 3)), (1, 1));
+
+        run(&tt, [remove(3, 2)]);
+        assert_eq!((aggregated(&tt, 1), aggregated(&tt, 3)), (1, 0));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pending_changes_drain_when_delay_is_disabled() {
+        let tt = setup_with_data(&[(1, UPPER), (2, INNER)], false);
+        {
+            let _delay = DelayOverride::set(true);
+            run(&tt, [add(1, 2)]);
+            set_dirty(&tt, 2, true);
+            emit(&tt, 2, 1);
+            assert_eq!((aggregated(&tt, 1), pending(&tt, 2)), (0, 1));
+        }
+
+        let _delay = DelayOverride::set(false);
+        set_dirty(&tt, 2, false);
+        assert_eq!((aggregated(&tt, 1), pending(&tt, 2)), (1, 0));
     }
 }
 
