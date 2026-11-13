@@ -61,6 +61,7 @@ import type { ClientReferenceManifest } from '../../build/webpack/plugins/flight
 import {
   getClientReferenceManifest,
   getRscModuleMappingForUseCache,
+  getActionDurability,
   getServerActionsManifest,
   getServerModuleMap,
   normalizeWorkerPageName,
@@ -4000,9 +4001,10 @@ async function computeCacheKeyImplementationPart(
     ? getServerActionsManifest().node[id]
     : undefined
   const codeHash =
-    entry?.workers?.[normalizeWorkerPageName(workStore.page)]?.durability
-  const durability =
-    codeHash !== undefined ? entry?.durability?.[codeHash] : undefined
+    entry?.workers?.[normalizeWorkerPageName(workStore.page)]?.codeHash
+  const durability = entry
+    ? getActionDurability(entry, codeHash, id)
+    : undefined
   if (codeHash !== undefined && durability) {
     // use cache is only supported in Node.js runtime. So we can use the Node.js crypto module here.
     const crypto = require('crypto') as typeof import('crypto')

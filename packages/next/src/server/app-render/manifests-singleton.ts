@@ -1,4 +1,7 @@
-import type { ActionManifest } from '../../build/webpack/plugins/flight-client-entry-plugin'
+import type {
+  ActionDurability,
+  ActionManifest,
+} from '../../build/webpack/plugins/flight-client-entry-plugin'
 import type { ClientReferenceManifest } from '../../build/webpack/plugins/flight-manifest-plugin'
 import type { DeepReadonly } from '../../shared/lib/deep-readonly'
 import { InvariantError } from '../../shared/lib/invariant-error'
@@ -26,6 +29,29 @@ export function getActionNotFoundError(actionId: string | null): Error {
   return new Error(
     `Failed to find Server Action${actionId ? ` "${actionId}"` : ''}. This request might be from an older or newer deployment.\nRead more: https://nextjs.org/docs/messages/failed-to-find-server-action`
   )
+}
+
+/**
+ * Looks up the durability metadata that a worker of an action references by
+ * its code hash. Returns `undefined` when the worker has no code hash, and
+ * throws when the code hash is set but missing from the action's durability
+ * map, because that means the manifest is inconsistent.
+ */
+export function getActionDurability(
+  action: DeepReadonly<ActionManifest['node'][string]>,
+  codeHash: string | undefined,
+  actionId: string
+): DeepReadonly<ActionDurability> | undefined {
+  if (codeHash === undefined) {
+    return undefined
+  }
+  const durability = action.durability?.[codeHash]
+  if (!durability) {
+    throw new InvariantError(
+      `Missing durability metadata for code hash "${codeHash}" of action "${actionId}" in the server reference manifest.`
+    )
+  }
+  return durability
 }
 
 export function getInvalidServerReferenceIdError(id: string): Error {
@@ -374,7 +400,7 @@ function createServerModuleMap(): ServerModuleMap {
         | {
             moduleId: string | number
             async: boolean
-            durability?: string
+            codeHash?: string
           }
         | undefined
 
@@ -395,17 +421,15 @@ function createServerModuleMap(): ServerModuleMap {
         throw getActionNotFoundError(id)
       }
 
-      const { moduleId, async, durability } = workerEntry
+      const { moduleId, async, codeHash } = workerEntry
+      const durability = getActionDurability(action, codeHash, id)
 
       return {
         id: moduleId,
         name: id,
         chunks: [],
         async,
-        durability:
-          durability !== undefined && action.durability?.[durability]
-            ? { codeHash: durability, ...action.durability[durability] }
-            : undefined,
+        durability: durability ? { codeHash, ...durability } : undefined,
       }
     },
   })
