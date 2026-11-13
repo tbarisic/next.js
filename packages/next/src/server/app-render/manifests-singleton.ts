@@ -374,7 +374,7 @@ function createServerModuleMap(): ServerModuleMap {
         | {
             moduleId: string | number
             async: boolean
-            durability?: number
+            durability?: string
           }
         | undefined
 
@@ -403,8 +403,8 @@ function createServerModuleMap(): ServerModuleMap {
         chunks: [],
         async,
         durability:
-          durability !== undefined
-            ? action.durability?.[durability]
+          durability !== undefined && action.durability?.[durability]
+            ? { codeHash: durability, ...action.durability[durability] }
             : undefined,
       }
     },
